@@ -1,0 +1,181 @@
+name: Create Base IaC and Restore EFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      terraform_action:
+        description: "Terraform action to run"
+        required: true
+        default: "apply"
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: ./terraform/iac
+
+  TF_VAR_region: us-east-1
+  TF_VAR_project_name: wordpress
+  TF_VAR_environment: dev
+  TF_VAR_vpc_cidr: 10.0.0.0/16
+  TF_VAR_public_subnet_az1_cidr: 10.0.0.0/24
+  TF_VAR_public_subnet_az2_cidr: 10.0.1.0/24
+  TF_VAR_private_app_subnet_az1_cidr: 10.0.2.0/24
+  TF_VAR_private_app_subnet_az2_cidr: 10.0.3.0/24
+  TF_VAR_private_data_subnet_az1_cidr: 10.0.4.0/24
+  TF_VAR_private_data_subnet_az2_cidr: 10.0.5.0/24
+
+  TF_VAR_database_snapshot_identifier: 
+  TF_VAR_database_instance_class: db.t3.micro
+  TF_VAR_database_instance_identifier: 
+  TF_VAR_multi_az_deployment: true
+
+  TF_VAR_rds_master_password: ${{ secrets.RDS_MASTER_PASSWORD }}
+
+  TF_VAR_target_type: instance
+  TF_VAR_certificate_arn: ${{ secrets.CERTIFICATE_ARN }}
+
+  TF_VAR_domain_name: lynkolds.com
+  TF_VAR_record_name: www
+
+jobs:
+  create_base_iac_and_restore_efs:
+    environment: wordpress-dev
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform apply or destroy base infrastructure
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform ${{ github.event.inputs.terraform_action }} -auto-approve
+
+      - name: Check if EFS is already restored
+        if: github.event.inputs.terraform_action == 'apply'
+        id: check_efs_restore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RECOVERY_POINT_ARN="${{ secrets.EFS_RECOVERY_POINT_ARN }}"
+
+          RESTORED_EFS_ARN=$(aws backup list-restore-jobs \
+            --region "$AWS_REGION" \
+            --by-resource-type EFS \
+            --by-status COMPLETED \
+            --query "reverse(sort_by(RestoreJobs[?RecoveryPointArn=='${RECOVERY_POINT_ARN}'], &CompletionDate))[0].CreatedResourceArn" \
+            --output text)
+
+          if [ -z "$RESTORED_EFS_ARN" ] || [ "$RESTORED_EFS_ARN" = "None" ]; then
+            echo "No completed EFS restore was found for this recovery point."
+            echo "efs_restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          RESTORED_EFS_ID="${RESTORED_EFS_ARN##*/}"
+
+          EFS_STATE=$(aws efs describe-file-systems \
+            --region "$AWS_REGION" \
+            --file-system-id "$RESTORED_EFS_ID" \
+            --query "FileSystems[0].LifeCycleState" \
+            --output text 2>/dev/null || true)
+
+          if [ "$EFS_STATE" = "available" ]; then
+            echo "EFS is already restored and available: $RESTORED_EFS_ID"
+            echo "efs_restored=true" >> "$GITHUB_OUTPUT"
+            echo "restored_efs_id=$RESTORED_EFS_ID" >> "$GITHUB_OUTPUT"
+          else
+            echo "The previous restored EFS does not exist or is not available."
+            echo "efs_restored=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore EFS from AWS Backup
+        if: github.event.inputs.terraform_action == 'apply' && steps.check_efs_restore.outputs.efs_restored == 'false'
+        id: restore_efs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESTORE_JOB_ID=$(aws backup start-restore-job \
+            --region "$AWS_REGION" \
+            --recovery-point-arn "${{ secrets.EFS_RECOVERY_POINT_ARN }}" \
+            --iam-role-arn "${{ secrets.AWS_BACKUP_RESTORE_ROLE_ARN }}" \
+            --resource-type EFS \
+            --metadata '{"newFileSystem":"true","PerformanceMode":"generalPurpose","Encrypted":"true","kmskeyid":"alias/aws/elasticfilesystem","CreationToken":"wordpress-restored-efs-${{ github.run_id }}"}' \
+            --query "RestoreJobId" \
+            --output text)
+
+          echo "Restore job started: $RESTORE_JOB_ID"
+
+          while true; do
+            STATUS=$(aws backup describe-restore-job \
+              --region "$AWS_REGION" \
+              --restore-job-id "$RESTORE_JOB_ID" \
+              --query "Status" \
+              --output text)
+
+            echo "Restore status: $STATUS"
+
+            if [ "$STATUS" = "COMPLETED" ]; then
+              break
+            fi
+
+            if [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "ABORTED" ]; then
+              aws backup describe-restore-job \
+                --region "$AWS_REGION" \
+                --restore-job-id "$RESTORE_JOB_ID" \
+                --query "{Status:Status,StatusMessage:StatusMessage}" \
+                --output table
+
+              echo "EFS restore failed."
+              exit 1
+            fi
+
+            sleep 30
+          done
+
+          CREATED_RESOURCE_ARN=$(aws backup describe-restore-job \
+            --region "$AWS_REGION" \
+            --restore-job-id "$RESTORE_JOB_ID" \
+            --query "CreatedResourceArn" \
+            --output text)
+
+          RESTORED_EFS_ID="${CREATED_RESOURCE_ARN##*/}"
+
+          echo "Restored EFS ID: $RESTORED_EFS_ID"
+          echo "restore_job_id=$RESTORE_JOB_ID" >> "$GITHUB_OUTPUT"
+          echo "restored_efs_id=$RESTORED_EFS_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Display restored EFS information
+        if: github.event.inputs.terraform_action == 'apply'
+        shell: bash
+        run: |
+          if [ "${{ steps.check_efs_restore.outputs.efs_restored }}" = "true" ]; then
+            echo "Existing restored EFS ID: ${{ steps.check_efs_restore.outputs.restored_efs_id }}"
+          else
+            echo "Newly restored EFS ID: ${{ steps.restore_efs.outputs.restored_efs_id }}"
+          fi

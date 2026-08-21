@@ -1,0 +1,215 @@
+name: Deploy Full AWS Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      terraform_action:
+        description: "Terraform action to run"
+        required: true
+        default: "apply"
+        type: choice
+        options:
+          - apply
+          - destroy
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_DIR: ./terraform/iac
+
+  EFS_RESOURCE_ADDRESS: aws_efs_file_system.efs_file_system
+  RESTORED_EFS_ID: ${{ secrets.EFS_ID }}
+
+  TF_VAR_region: us-east-1
+  TF_VAR_project_name: wordpress
+  TF_VAR_environment: dev
+  TF_VAR_vpc_cidr: 10.0.0.0/16
+  TF_VAR_public_subnet_az1_cidr: 10.0.0.0/24
+  TF_VAR_public_subnet_az2_cidr: 10.0.1.0/24
+  TF_VAR_private_app_subnet_az1_cidr: 10.0.2.0/24
+  TF_VAR_private_app_subnet_az2_cidr: 10.0.3.0/24
+  TF_VAR_private_data_subnet_az1_cidr: 10.0.4.0/24
+  TF_VAR_private_data_subnet_az2_cidr: 10.0.5.0/24
+
+  TF_VAR_database_snapshot_identifier: 
+  TF_VAR_database_instance_class: db.t3.micro
+  TF_VAR_database_instance_identifier: 
+  TF_VAR_multi_az_deployment: "true"
+
+  TF_VAR_rds_master_password: ${{ secrets.RDS_MASTER_PASSWORD }}
+
+  TF_VAR_target_type: instance
+  TF_VAR_certificate_arn: ${{ secrets.CERTIFICATE_ARN }}
+
+  TF_VAR_domain_name: lynkolds.com
+  TF_VAR_record_name: www
+
+  TF_VAR_wordpress_ec2_iam_role_name: 
+  TF_VAR_wordpress_ec2_instance_profile_name: 
+
+  TF_VAR_wordpress_ami_id: ${{ secrets.WORDPRESS_AMI_ID }}
+  TF_VAR_instance_type: t3.micro
+  TF_VAR_asg_desired_capacity: 2
+  TF_VAR_asg_min_size: 2
+  TF_VAR_asg_max_size: 4
+  TF_VAR_sns_email_endpoint: ${{ secrets.SNS_EMAIL_ENDPOINT }}
+
+jobs:
+  deploy_full_iac:
+    environment: wordpress-dev
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform init \
+            -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ vars.TF_STATE_KEY }}" \
+            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+
+      - name: Terraform validate
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform validate
+
+      - name: Validate restored EFS ID
+        if: inputs.terraform_action == 'apply'
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RESTORED_EFS_ID:-}" ]; then
+            echo "The wordpress-dev environment secret EFS_ID is empty or missing."
+            exit 1
+          fi
+
+          if [[ ! "$RESTORED_EFS_ID" =~ ^fs-[0-9a-f]+$ ]]; then
+            echo "The EFS_ID secret is not a valid EFS file-system ID."
+            exit 1
+          fi
+
+          echo "The restored EFS ID has a valid format."
+
+      - name: Confirm restored EFS exists
+        if: inputs.terraform_action == 'apply'
+        run: |
+          set -euo pipefail
+
+          if ! EFS_STATE=$(aws efs describe-file-systems \
+            --region "$AWS_REGION" \
+            --file-system-id "$RESTORED_EFS_ID" \
+            --query "FileSystems[0].LifeCycleState" \
+            --output text); then
+
+            echo "Unable to find EFS file system $RESTORED_EFS_ID."
+            exit 1
+          fi
+
+          if [ "$EFS_STATE" != "available" ]; then
+            echo "EFS $RESTORED_EFS_ID is not available."
+            echo "Current state: $EFS_STATE"
+            exit 1
+          fi
+
+          echo "Restored EFS is available: $RESTORED_EFS_ID"
+
+      - name: Check whether restored EFS is already imported
+        if: inputs.terraform_action == 'apply'
+        id: check_efs_import
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          set -euo pipefail
+
+          if terraform state show -no-color "$EFS_RESOURCE_ADDRESS" > /dev/null 2>&1; then
+            STATE_TEXT=$(terraform state show -no-color "$EFS_RESOURCE_ADDRESS")
+
+            STATE_EFS_ID=$(echo "$STATE_TEXT" |
+              sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' |
+              head -n 1)
+
+            if [ -z "$STATE_EFS_ID" ]; then
+              echo "The EFS resource exists in Terraform state, but its file-system ID could not be identified."
+              exit 1
+            fi
+
+            if [ "$STATE_EFS_ID" != "$RESTORED_EFS_ID" ]; then
+              echo "Terraform address $EFS_RESOURCE_ADDRESS currently manages $STATE_EFS_ID."
+              echo "The EFS_ID secret contains $RESTORED_EFS_ID."
+              exit 1
+            fi
+
+            echo "efs_imported=true" >> "$GITHUB_OUTPUT"
+            echo "EFS is already imported at $EFS_RESOURCE_ADDRESS."
+          else
+            echo "efs_imported=false" >> "$GITHUB_OUTPUT"
+            echo "EFS is not currently imported."
+          fi
+
+      - name: Import restored EFS into Terraform state
+        if: inputs.terraform_action == 'apply' && steps.check_efs_import.outputs.efs_imported == 'false'
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          set -euo pipefail
+
+          terraform import \
+            -input=false \
+            "$EFS_RESOURCE_ADDRESS" \
+            "$RESTORED_EFS_ID"
+
+      - name: Confirm EFS import
+        if: inputs.terraform_action == 'apply'
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          set -euo pipefail
+
+          if ! terraform state show -no-color "$EFS_RESOURCE_ADDRESS"; then
+            echo "The restored EFS was not successfully imported into Terraform state."
+            exit 1
+          fi
+
+          echo "EFS import confirmed."
+
+      - name: Terraform plan full infrastructure
+        if: inputs.terraform_action == 'apply'
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform plan \
+            -input=false \
+            -out=tfplan
+
+      - name: Terraform apply full infrastructure
+        if: inputs.terraform_action == 'apply'
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform apply \
+            -input=false \
+            -auto-approve \
+            tfplan
+
+      - name: Terraform destroy full infrastructure
+        if: inputs.terraform_action == 'destroy'
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: |
+          terraform destroy \
+            -input=false \
+            -auto-approve
